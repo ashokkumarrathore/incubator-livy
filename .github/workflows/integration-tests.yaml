@@ -32,6 +32,7 @@ jobs:
         - "-Pscala-2.11 -Pspark2"
         - "-Pscala-2.12 -Pspark2"
         - "-Pscala-2.12 -Pspark3"
+        - "-Pscala-2.12 -Pspark3 -Phadoop3"
     steps:
     - 
       name: Checkout
