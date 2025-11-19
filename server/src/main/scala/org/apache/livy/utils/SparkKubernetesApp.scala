@@ -19,7 +19,9 @@ package org.apache.livy.utils
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent._
+
 import scala.annotation.tailrec
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent._
 import scala.concurrent.duration._
@@ -697,7 +699,7 @@ private[utils] object KubernetesExtensions {
     }
 
     def killApplication(app: KubernetesApplication): Boolean = {
-      client.pods.inAnyNamespace.delete(app.getApplicationPod)
+      client.pods.inNamespace(app.getApplicationNamespace).delete(app.getApplicationPod)
     }
 
     def getApplicationReport(
