@@ -705,7 +705,7 @@ private[utils] object KubernetesExtensions {
     }
 
     def killApplication(app: KubernetesApplication): Boolean = {
-      client.pods.inAnyNamespace.delete(app.getApplicationPod)
+      client.pods.inNamespace(app.getApplicationNamespace).delete(app.getApplicationPod)
     }
 
     def getApplicationReport(
