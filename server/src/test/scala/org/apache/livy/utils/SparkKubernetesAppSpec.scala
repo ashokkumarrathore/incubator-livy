@@ -207,6 +207,32 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite with Bef
 
   }
 
+  describe("SparkKubernetesApp.kill") {
+    it("should remove the app from the monitor queue and be idempotent") {
+      // Drain anything left over from prior tests so we can assert exact size.
+      SparkKubernetesApp.clearApps
+      val sizeBefore = SparkKubernetesApp.getAppSize
+      val app = new SparkKubernetesApp(
+        "test-kill-tag",
+        None,
+        None,
+        None,
+        new LivyConf(false),
+        Map(SparkApp.SPARK_KUBERNETES_NAMESPACE_KEY -> "ns"),
+        SparkKubernetesApp.kubernetesClient)
+
+      // Constructor enqueues itself.
+      assert(SparkKubernetesApp.getAppSize === sizeBefore + 1)
+
+      app.kill()
+      assert(SparkKubernetesApp.getAppSize === sizeBefore)
+
+      // Idempotent: a second call must be a no-op for the queue.
+      app.kill()
+      assert(SparkKubernetesApp.getAppSize === sizeBefore)
+    }
+  }
+
   describe("KubernetesClientFactory") {
     it("should build KubernetesApi url from LivyConf masterUrl") {
       def actual(sparkMaster: String): String =
