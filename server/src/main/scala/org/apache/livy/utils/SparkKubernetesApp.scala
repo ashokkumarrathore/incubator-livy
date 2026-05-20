@@ -19,6 +19,7 @@ package org.apache.livy.utils
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent._
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.annotation.tailrec
 import scala.collection.mutable
@@ -262,7 +263,8 @@ class SparkKubernetesApp private[utils] (
   import SparkKubernetesApp._
 
   appQueue.add(this)
-  private var killed = false
+  // Atomic so the monitor thread sees the write from kill() without locking.
+  private val killed = new AtomicBoolean(false)
   private val appPromise: Promise[KubernetesApplication] = Promise()
   private[utils] var state: SparkApp.State = SparkApp.State.STARTING
   private var kubernetesDiagnostics: IndexedSeq[String] = IndexedSeq.empty[String]
@@ -296,10 +298,15 @@ class SparkKubernetesApp private[utils] (
 
   private def monitorSparkKubernetesApp(): Unit = {
     try {
-      if (killed) {
+      // Skip the body if the app already reached a terminal state.
+      // Falling through would re-fire appIdKnown.
+      if (killed.get()) {
         changeState(SparkApp.State.KILLED)
-      } else if (isProcessErrExit) {
+        return
+      }
+      if (isProcessErrExit) {
         changeState(SparkApp.State.FAILED)
+        return
       }
       // Get KubernetesApplication by appTag.
       val appOption: Option[KubernetesApplication] = try {
@@ -395,7 +402,11 @@ class SparkKubernetesApp private[utils] (
       ("\nKubernetes Diagnostics: " +: kubernetesDiagnostics)
 
   override def kill(): Unit = synchronized {
-    killed = true
+    killed.set(true)
+    // Detach from the shared monitor queue so a polling tick cannot fall
+    // through to appIdKnown and resurrect recovery state after the owning
+    // session has been deleted.
+    appQueue.remove(this)
 
     if (!isRunning) {
       return
