@@ -319,7 +319,7 @@ class SparkKubernetesApp private[utils] (
         case e: Exception =>
           failToGetAppId()
           error(s"Exception getting app from tag $appTag in namespace $namespace with message: ", e)
-          appPromise.failure(e)
+          appPromise.tryFailure(e)
           return
       }
       if (appOption.isEmpty) {
