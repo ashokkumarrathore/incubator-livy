@@ -18,6 +18,8 @@ package org.apache.livy.utils
 
 import java.util.Objects._
 
+import scala.concurrent.Promise
+
 import io.fabric8.kubernetes.api.model._
 import io.fabric8.kubernetes.api.model.networking.v1.{Ingress, IngressRule, IngressSpec}
 import io.fabric8.kubernetes.client.KubernetesClient
@@ -205,6 +207,24 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite with Bef
       }
     }
 
+  }
+
+  describe("SparkKubernetesApp.appPromise") {
+    it("tryFailure must be a no-op after trySuccess (no IllegalStateException)") {
+      val p = Promise[KubernetesApplication]()
+      val app = mock[KubernetesApplication]
+      assert(p.trySuccess(app))
+      assert(!p.tryFailure(new IllegalStateException("simulated k8s API error")))
+      assert(p.future.value.exists(_.isSuccess))
+    }
+
+    it("trySuccess must be a no-op after tryFailure") {
+      val p = Promise[KubernetesApplication]()
+      assert(p.tryFailure(new IllegalStateException("simulated k8s API error")))
+      val app = mock[KubernetesApplication]
+      assert(!p.trySuccess(app))
+      assert(p.future.value.exists(_.isFailure))
+    }
   }
 
   describe("SparkKubernetesApp.kill") {
