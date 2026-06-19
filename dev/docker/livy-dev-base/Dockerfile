@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-FROM ubuntu:xenial
+FROM ubuntu:noble
 
 # configure locale
 RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-recommends \
@@ -23,7 +23,9 @@ RUN apt-get update -qq > /dev/null && apt-get install -qq --yes --no-install-rec
     locale-gen en_US.UTF-8
 ENV LANG="en_US.UTF-8" \
     LANGUAGE="en_US.UTF-8" \
-    LC_ALL="en_US.UTF-8"
+    LC_ALL="en_US.UTF-8" \
+    TZ=US \
+    DEBIAN_FRONTEND=noninteractive
 
 # Install necessary dependencies for build/test/debug
 # Use `lsof -i -P -n` to find open ports
@@ -32,45 +34,60 @@ RUN apt-get install -qq \
     curl \
     git \
     libkrb5-dev \
+    openjdk-8-jdk-headless \
+    openjdk-17-jdk-headless \
+    r-base \
     maven \
-    openjdk-8-jdk \
-    python-dev \
-    python-pip \
-    python3-pip \
     software-properties-common \
     vim \
     wget \
     telnet \
     lsof
 
-# R 3.x install - ensure to add the signing key per https://cran.r-project.org/bin/linux/ubuntu/olderreleasesREADME.html
-RUN add-apt-repository 'deb https://cloud.r-project.org/bin/linux/ubuntu xenial-cran35/' && \
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys E298A3A825C0D65DFD57CBB651716619E084DAB9 && \
-    apt-get update && \
-    apt-get -qq install r-base
+# This fixes integration tests
+# If setsid is available, signals are sent to containers in MiniYarnCluster using negative pids, however
+# in the Docker container this results in a kill(0) system call which triggers an ExitCodeException in
+# the kill function that breaks test execution. If setsid is removed, pids < 0 are not used.
+# See https://github.com/apache/hadoop/blob/rel/release-2.7.3/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/Shell.java#L238
+RUN rm /usr/bin/setsid
 
-# Add build dependencies for python2
-# - First we upgrade pip because that makes a lot of things better
-# - Then we remove the provided version of setuptools and install a different version
-# - Then we install additional dependencies
-RUN python -m pip install -U "pip < 21.0" && \
-	apt-get remove -y python-setuptools && \
-	python -m pip install "setuptools < 36" && \
-	python -m pip install \
+# python build
+RUN apt-get install -y \
+  build-essential \
+  libbz2-dev \
+  libffi-dev \
+  liblzma-dev \
+  libncurses-dev \
+  libreadline-dev \
+  libsqlite3-dev \
+  libssl-dev \
+  zlib1g-dev
+
+ENV HOME=/root
+
+RUN git clone https://github.com/pyenv/pyenv.git $HOME/pyenv
+
+ENV PYENV_ROOT=$HOME/pyenv
+ENV PATH="$HOME/pyenv/shims:$HOME/pyenv/bin:$HOME/bin:$PATH"
+
+RUN pyenv install -v 3.9.21 && \
+  pyenv global 3.9.21 && \
+  pyenv rehash
+
+# Install build dependencies for python3
+RUN python3 -m pip install -U pip && pip3 install \
         cloudpickle \
         codecov \
         flake8 \
         flaky \
-        "future>=0.15.2" \
-        "futures>=3.0.5" \
         pytest \
         pytest-runner \
         requests-kerberos \
-        "requests >= 2.10.0" \
-        "responses >= 0.5.1"
+        requests \
+        responses
 
-# Now do the same for python3
-RUN python3 -m pip install -U pip
+RUN pyenv rehash
+
+RUN apt remove -y openjdk-11-jre-headless
 
 WORKDIR /workspace
-
