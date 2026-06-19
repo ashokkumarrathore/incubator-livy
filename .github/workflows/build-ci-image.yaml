@@ -15,9 +15,10 @@
 # limitations under the License.
 #
 name: 'Build CI images'
-on: 
+on:
+  workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ["master", "main"]
     paths:
     - 'dev/docker/livy-dev-base/Dockerfile'
 jobs:
@@ -43,6 +44,6 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           push: true
-          context: ./dev/docker
+          context: ./dev/docker/livy-dev-base
           tags: |
             ghcr.io/${{ github.repository_owner }}/livy-ci:latest
