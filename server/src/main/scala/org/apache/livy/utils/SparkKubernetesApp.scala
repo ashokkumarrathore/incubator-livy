@@ -21,6 +21,8 @@ import java.util.Collections
 import java.util.concurrent._
 
 import scala.annotation.tailrec
+import scala.collection.JavaConverters.asScalaSetConverter
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent._
 import scala.concurrent.duration._
@@ -47,29 +49,48 @@ object SparkKubernetesApp extends Logging {
     override def run(): Unit = {
       import KubernetesExtensions._
       while (true) {
-        if (!leakedAppTags.isEmpty) {
-          // kill the app if found it and remove it if exceeding a threshold
-          val iter = leakedAppTags.entrySet().iterator()
-          var isRemoved = false
-          val now = System.currentTimeMillis()
-          val apps = withRetry(kubernetesClient.getApplications())
-          while (iter.hasNext) {
-            val entry = iter.next()
-            apps.find(_.getApplicationTag.contains(entry.getKey))
-              .foreach({
-                app =>
-                  info(s"Kill leaked app ${app.getApplicationId}")
-                  withRetry(kubernetesClient.killApplication(app))
+        // Guard the whole cycle: an unexpected error must never terminate this daemon
+        // thread, otherwise leaked-app GC would silently stop for the whole server.
+        try {
+          if (!leakedAppTags.isEmpty) {
+            // kill the app if found it and remove it if exceeding a threshold
+            val iter = leakedAppTags.entrySet().iterator()
+            var isRemoved = false
+            val now = System.currentTimeMillis()
+            val apps = appNamespaces.flatMap { namespace =>
+              // Isolate per-namespace failures: losing access to (or deletion of) one
+              // namespace must not stop GC from sweeping the others this cycle.
+              try {
+                withRetry(kubernetesClient.getApplications(namespace))
+              } catch {
+                case NonFatal(e) =>
+                  warn(s"Failed to list Spark applications in namespace '$namespace' during " +
+                    s"leaked-app GC; skipping it this cycle: ${e.getMessage}")
+                  Seq.empty[KubernetesApplication]
+              }
+            }
+            while (iter.hasNext) {
+              val entry = iter.next()
+              apps.find(_.getApplicationTag.contains(entry.getKey))
+                .foreach({
+                  app =>
+                    info(s"Kill leaked app ${app.getApplicationId}")
+                    withRetry(kubernetesClient.inNamespace(app.getApplicationNamespace)
+                      .killApplication(app))
+                    iter.remove()
+                    isRemoved = true
+                })
+              if (!isRemoved) {
+                if ((entry.getValue - now) > sessionLeakageCheckTimeout) {
                   iter.remove()
-                  isRemoved = true
-              })
-            if (!isRemoved) {
-              if ((entry.getValue - now) > sessionLeakageCheckTimeout) {
-                iter.remove()
-                info(s"Remove leaked Kubernetes app tag ${entry.getKey}")
+                  info(s"Remove leaked Kubernetes app tag ${entry.getKey}")
+                }
               }
             }
           }
+        } catch {
+          case NonFatal(e) =>
+            error("Unexpected error during leaked-application GC; retrying next cycle.", e)
         }
         Thread.sleep(sessionLeakageCheckInterval)
       }
@@ -156,6 +177,8 @@ object SparkKubernetesApp extends Logging {
   private var sessionLeakageCheckInterval: Long = _
 
   var kubernetesClient: DefaultKubernetesClient = _
+  var appNamespaces: mutable.Set[String] =
+    ConcurrentHashMap.newKeySet[String]().asScala
 
   private var appLookupThreadPoolSize: Long = _
   private var appLookupMaxFailedTimes: Long = _
@@ -164,8 +187,7 @@ object SparkKubernetesApp extends Logging {
     this.livyConf = livyConf
 
     // KubernetesClient is thread safe. Create once, share it across threads.
-    kubernetesClient =
-      KubernetesClientFactory.createKubernetesClient(livyConf)
+    kubernetesClient = KubernetesClientFactory.createKubernetesClient(livyConf)
 
     cacheLogSize = livyConf.getInt(LivyConf.SPARK_LOGS_SIZE)
     appLookupTimeout = livyConf.getTimeAsMs(LivyConf.KUBERNETES_APP_LOOKUP_TIMEOUT).milliseconds
@@ -268,7 +290,9 @@ class SparkKubernetesApp private[utils] (
   process: Option[LineBufferedProcess],
   listener: Option[SparkAppListener],
   livyConf: LivyConf,
-  kubernetesClient: => KubernetesClient = SparkKubernetesApp.kubernetesClient) // For unit test.
+  extrasMap: Map[String, String],
+  // For unit test.
+  kubernetesClient: => DefaultKubernetesClient = SparkKubernetesApp.kubernetesClient)
   extends SparkApp
     with Logging {
 
@@ -285,6 +309,13 @@ class SparkKubernetesApp private[utils] (
   private var kubernetesTagToAppIdFailedTimes: Int = _
   private var kubernetesAppMonitorFailedTimes: Int = _
 
+  // Recovery metadata written before multi-namespace support has no namespace and
+  // deserializes to null (jackson-module-scala fills absent reference params with null,
+  // ignoring Scala default values). Treat null/missing as "" ("unknown") and resolve the
+  // real namespace once the driver pod is discovered (see monitorSparkKubernetesApp).
+  private var namespace: String =
+    Option(extrasMap.getOrElse(SparkApp.SPARK_KUBERNETES_NAMESPACE_KEY, "")).getOrElse("")
+  appNamespaces.add(namespace)
   private def failToMonitor(): Unit = {
     changeState(SparkApp.State.FAILED)
     process.foreach(_.destroy())
@@ -315,10 +346,11 @@ class SparkKubernetesApp private[utils] (
       }
       // Get KubernetesApplication by appTag.
       val appOption: Option[KubernetesApplication] = try {
-        getAppFromTag(appTag, pollInterval, appLookupTimeout.fromNow)
+        getAppFromTag(appTag, pollInterval, appLookupTimeout.fromNow, namespace)
       } catch {
         case e: Exception =>
           failToGetAppId()
+          error(s"Exception getting app from tag $appTag in namespace $namespace with message: ", e)
           appPromise.failure(e)
           return
       }
@@ -327,6 +359,13 @@ class SparkKubernetesApp private[utils] (
         return
       }
       val app: KubernetesApplication = appOption.get
+      // For a session recovered from pre-multi-namespace metadata the namespace is unknown
+      // until the driver pod is found. Adopt the pod's real namespace so the report, ingress
+      // and leaked-app GC operations below target the correct namespace.
+      if (namespace == null || namespace.isEmpty) {
+        namespace = app.getApplicationNamespace
+        appNamespaces.add(namespace)
+      }
       appPromise.trySuccess(app)
       val appId = app.getApplicationId
 
@@ -334,7 +373,7 @@ class SparkKubernetesApp private[utils] (
       listener.foreach(_.appIdKnown(appId))
 
       if (livyConf.getBoolean(LivyConf.KUBERNETES_INGRESS_CREATE)) {
-        withRetry(kubernetesClient.createSparkUIIngress(app, livyConf))
+        withRetry(kubernetesClient.inNamespace(namespace).createSparkUIIngress(app, livyConf))
       }
 
       var appInfo = AppInfo()
@@ -349,7 +388,7 @@ class SparkKubernetesApp private[utils] (
             debug(s"getApplicationReport, applicationId: ${app.getApplicationId}, " +
               s"namespace: ${app.getApplicationNamespace} " +
               s"applicationTag: ${app.getApplicationTag}")
-            val report = kubernetesClient.getApplicationReport(livyConf, app,
+            val report = kubernetesClient.inNamespace(namespace).getApplicationReport(livyConf, app,
               cacheLogSize = cacheLogSize)
             report
           }
@@ -422,7 +461,7 @@ class SparkKubernetesApp private[utils] (
     def kubernetesApplication: KubernetesApplication = applicationDetails.get.get
     if (kubernetesApplication != null && kubernetesApplication.getApplicationId != null) {
       try {
-        withRetry(kubernetesClient.killApplication(
+        withRetry(kubernetesClient.inNamespace(namespace).killApplication(
           Await.result(appPromise.future, appLookupTimeout)))
       } catch {
         // We cannot kill the Kubernetes app without the appTag.
@@ -463,10 +502,11 @@ class SparkKubernetesApp private[utils] (
   private def getAppFromTag(
     appTag: String,
     pollInterval: duration.Duration,
-    deadline: Deadline): Option[KubernetesApplication] = {
+    deadline: Deadline,
+    namespace: String): Option[KubernetesApplication] = {
     import KubernetesExtensions._
-
-    withRetry(kubernetesClient.getApplications().find(_.getApplicationTag.contains(appTag)))
+    withRetry(kubernetesClient.getApplications(namespace)
+      .find(_.getApplicationTag.contains(appTag)))
     match {
       case Some(app) => Some(app)
       case None =>
@@ -705,13 +745,20 @@ private[utils] object KubernetesExtensions {
       """.stripMargin
 
     def getApplications(
+      namespace: String = "",
       labels: Map[String, String] = Map(SPARK_ROLE_LABEL -> SPARK_ROLE_DRIVER),
       appTagLabel: String = SPARK_APP_TAG_LABEL,
       appIdLabel: String = SPARK_APP_ID_LABEL
     ): Seq[KubernetesApplication] = {
-      client.pods.inAnyNamespace
-        .withLabels(labels.asJava)
-        .withLabel(appTagLabel)
+      // An empty namespace means "unknown" (e.g. a session recovered from pre-multi-namespace
+      // metadata); scan all namespaces so the driver pod can still be located, matching the
+      // pre-multi-namespace behavior. A concrete namespace scopes the LIST to that tenant.
+      val pods = if (namespace == null || namespace.isEmpty) {
+        client.pods.inAnyNamespace.withLabels(labels.asJava)
+      } else {
+        client.pods.inNamespace(namespace).withLabels(labels.asJava)
+      }
+      pods.withLabel(appTagLabel)
         .withLabel(appIdLabel)
         .list.getItems.asScala.map(new KubernetesApplication(_)).toSeq
     }
