@@ -20,13 +20,16 @@ package org.apache.livy.server
 import java.security.AccessControlException
 import javax.servlet.http.HttpServletRequest
 
-import org.scalatra._
+import scala.annotation.tailrec
 import scala.concurrent._
 import scala.concurrent.duration._
+
+import org.scalatra._
 
 import org.apache.livy.{LivyConf, Logging}
 import org.apache.livy.rsc.RSCClientFactory
 import org.apache.livy.server.batch.BatchSession
+import org.apache.livy.server.recovery.StateFileCollisionException
 import org.apache.livy.sessions.{Session, SessionManager}
 import org.apache.livy.sessions.Session.RecoveryMetadata
 
@@ -54,6 +57,33 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
    * parsing the body of the request.
    */
   protected def createSession(req: HttpServletRequest): S
+
+  /**
+   * Wraps session creation with automatic retry when a session id cannot be
+   * claimed exclusively in the state store (its state file already exists). On
+   * each collision the in-memory counter has already been advanced by nextId(),
+   * so the next attempt uses a fresh id.
+   */
+  protected def withCollisionRetry(create: => S): S = {
+    val maxRetries = livyConf.getInt(LivyConf.SESSION_ID_COLLISION_MAX_RETRIES)
+    @tailrec
+    def attempt(n: Int): S = {
+      try {
+        create
+      } catch {
+        case e: StateFileCollisionException =>
+          if (n >= maxRetries) {
+            SessionServlet.error(s"Exhausted $maxRetries " +
+              s"retries for collision: ${e.getMessage}")
+            throw e
+          }
+          SessionServlet.warn(s"${e.getMessage} " +
+            s"(attempt ${n + 1}/$maxRetries), trying next ID")
+          attempt(n + 1)
+      }
+    }
+    attempt(0)
+  }
 
   /**
    * Returns a object representing the session data to be sent back to the client.
@@ -140,6 +170,12 @@ abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
             headers = Map("Location" ->
               (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
         } catch {
+          case e: StateFileCollisionException =>
+            // All retries exhausted: the session id could not be claimed
+            // exclusively in the state store. Signal the client to retry
+            // rather than surfacing an opaque 500.
+            ServiceUnavailable(ResponseMessage("Rejected, Reason: " + e.getMessage),
+              headers = Map("Retry-After" -> "1"))
           case e: IllegalArgumentException =>
             BadRequest(ResponseMessage("Rejected, Reason: " + e.getMessage))
         }

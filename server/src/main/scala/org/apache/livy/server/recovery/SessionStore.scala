@@ -29,6 +29,18 @@ import org.apache.livy.sessions.Session.RecoveryMetadata
 private[recovery] case class SessionManagerState(nextSessionId: Int)
 
 /**
+ * Thrown when a session state file already exists during an exclusive create attempt.
+ * This indicates the given session id has already been claimed in the state store.
+ *
+ * @param sessionId The session ID that collided.
+ * @param sessionType The type of session ("batch" or "interactive").
+ */
+class StateFileCollisionException(val sessionId: Int, sessionType: String)
+  extends IllegalStateException(
+    s"State file for $sessionType session $sessionId already exists -- " +
+    "the id may have already been claimed.")
+
+/**
  * SessionStore provides high level functions to get/save session state from/to StateStore.
  */
 class SessionStore(
@@ -44,6 +56,14 @@ class SessionStore(
    */
   def save(sessionType: String, m: RecoveryMetadata): Unit = {
     store.set(sessionPath(sessionType, m.id), m)
+  }
+
+  /**
+   * O_CREAT|O_EXCL: save only if no state file exists for this session yet.
+   * @return true if created, false if already existed.
+   */
+  def trySave(sessionType: String, m: RecoveryMetadata): Boolean = {
+    store.tryExclusiveCreate(sessionPath(sessionType, m.id), m)
   }
 
   def saveNextSessionId(sessionType: String, id: Int): Unit = {

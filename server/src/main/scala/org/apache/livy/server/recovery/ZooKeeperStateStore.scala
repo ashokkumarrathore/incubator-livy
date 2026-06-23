@@ -44,6 +44,10 @@ class ZooKeeperStateStore(
     zkManager.remove(prefixKey(key))
   }
 
+  override def tryExclusiveCreate(key: String, value: Object): Boolean = {
+    zkManager.createIfAbsent(prefixKey(key), value)
+  }
+
   def getZooKeeperManager(): ZooKeeperManager = {
     zkManager
   }

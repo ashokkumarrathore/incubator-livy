@@ -24,7 +24,7 @@ import scala.util.Random
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import org.apache.livy.{LivyConf, Logging, Utils}
 import org.apache.livy.server.AccessManager
-import org.apache.livy.server.recovery.SessionStore
+import org.apache.livy.server.recovery.{SessionStore, StateFileCollisionException}
 import org.apache.livy.sessions.{FinishedSessionState, Session, SessionState}
 import org.apache.livy.sessions.Session._
 import org.apache.livy.utils.{AppInfo, SparkApp, SparkAppListener, SparkProcessBuilder}
@@ -64,6 +64,20 @@ object BatchSession extends Logging {
     val appTag = s"livy-batch-$id-${Random.alphanumeric.take(8).mkString}".toLowerCase()
     val impersonatedUser = accessManager.checkImpersonation(proxyUser, owner)
     val namespace = SparkApp.getNamespace(request.conf, livyConf)
+
+    // Claim the session id exclusively in the state store before constructing
+    // the session object so collisions surface synchronously to the retry
+    // wrapper in SessionServlet -- the alternative (throwing inside the
+    // deferred createSparkApp lambda) fires after register() has already been
+    // called, outside the retry's scope.
+    val initialMetadata =
+      BatchRecoveryMetadata(id, name, None, appTag, owner, impersonatedUser, namespace)
+    if (!sessionStore.trySave(BatchSession.RECOVERY_SESSION_TYPE, initialMetadata)) {
+      throw new StateFileCollisionException(id, "batch")
+    }
+
+    // No try/catch needed here -- unlike InteractiveSession.create, nothing between
+    // trySave and the constructor does I/O. createSparkApp is a deferred lambda.
     def createSparkApp(s: BatchSession): SparkApp = {
       val conf = SparkApp.prepareSparkConf(
         appTag,
@@ -84,8 +98,6 @@ object BatchSession extends Logging {
       request.numExecutors.foreach(builder.numExecutors)
       request.queue.foreach(builder.queue)
       request.name.foreach(builder.name)
-
-      sessionStore.save(BatchSession.RECOVERY_SESSION_TYPE, s.recoveryMetadata)
 
       builder.redirectOutput(Redirect.PIPE)
       builder.redirectErrorStream(true)

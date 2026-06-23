@@ -270,6 +270,8 @@ class SparkKubernetesApp private[utils] (
   private var kubernetesDiagnostics: IndexedSeq[String] = IndexedSeq.empty[String]
   private var kubernetesAppLog: IndexedSeq[String] = IndexedSeq.empty[String]
 
+  // Latches the first observed app ID; subsequent polls returning a different ID are rejected.
+  @volatile private var knownAppId: Option[String] = appIdOption
   private var kubernetesTagToAppIdFailedTimes: Int = _
   private var kubernetesAppMonitorFailedTimes: Int = _
 
@@ -323,8 +325,26 @@ class SparkKubernetesApp private[utils] (
         return
       }
       val app: KubernetesApplication = appOption.get
-      appPromise.trySuccess(app)
       val appId = app.getApplicationId
+
+      knownAppId match {
+        case Some(known) if known != appId =>
+          val msg = s"App ID changed for tag $appTag: was $known, now $appId. Rejecting."
+          error(msg)
+          // Fail the promise so consumers blocked on Await.result(appPromise.future, ...)
+          // surface the mismatch immediately instead of waiting the full appLookupTimeout.
+          appPromise.tryFailure(new IllegalStateException(msg))
+          // Drive the session to FAILED, destroy the spark-submit process, and mark the
+          // tag as leaked so the monitor doesn't keep polling. Mirrors the treatment of
+          // other terminal failures (e.g. failToGetAppId exhausted).
+          kubernetesDiagnostics = ArrayBuffer(msg)
+          failToMonitor()
+          return
+        case None =>
+          knownAppId = Some(appId)
+        case _ => // Same app ID re-polled; no-op.
+      }
+      appPromise.trySuccess(app)
 
       Thread.currentThread().setName(s"kubernetesAppMonitorThread-$appId")
       listener.foreach(_.appIdKnown(appId))

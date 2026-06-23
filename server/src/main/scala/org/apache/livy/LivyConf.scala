@@ -234,6 +234,11 @@ object LivyConf {
   val RECOVERY_ZK_STATE_STORE_KEY_PREFIX =
     Entry("livy.server.recovery.zk-state-store.key-prefix", "livy")
 
+  // Max number of times session creation retries with a fresh id when the id's state
+  // file already exists (exclusive-create collision) before failing with 503.
+  val SESSION_ID_COLLISION_MAX_RETRIES =
+    Entry("livy.server.session.id-collision.max-retries", 10)
+
   // Livy will cache the max no of logs specified. 0 means don't cache the logs.
   val SPARK_LOGS_SIZE = Entry("livy.cache-log.size", 200)
 

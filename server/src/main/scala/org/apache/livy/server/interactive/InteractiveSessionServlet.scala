@@ -53,9 +53,7 @@ class InteractiveSessionServlet(
 
   override protected def createSession(req: HttpServletRequest): InteractiveSession = {
     val createRequest = bodyAs[CreateInteractiveRequest](req)
-    val sessionId = sessionManager.nextId();
 
-    // Calling getTimeAsMs just to validate the ttl and idleTimeout values
     if (createRequest.ttl.isDefined) {
       ClientConf.getTimeAsMs(createRequest.ttl.get);
     }
@@ -63,17 +61,20 @@ class InteractiveSessionServlet(
       ClientConf.getTimeAsMs(createRequest.idleTimeout.get);
     }
 
-    InteractiveSession.create(
-      sessionId,
-      createRequest.name,
-      remoteUser(req),
-      proxyUser(req, createRequest.proxyUser),
-      livyConf,
-      accessManager,
-      createRequest,
-      sessionStore,
-      createRequest.ttl,
-      createRequest.idleTimeout)
+    withCollisionRetry {
+      val sessionId = sessionManager.nextId()
+      InteractiveSession.create(
+        sessionId,
+        createRequest.name,
+        remoteUser(req),
+        proxyUser(req, createRequest.proxyUser),
+        livyConf,
+        accessManager,
+        createRequest,
+        sessionStore,
+        createRequest.ttl,
+        createRequest.idleTimeout)
+    }
   }
 
   override protected[interactive] def clientSessionView(

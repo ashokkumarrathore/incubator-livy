@@ -19,6 +19,9 @@ package org.apache.livy.server.recovery
 
 import java.io.{FileNotFoundException, IOException}
 import java.net.URI
+import java.nio.ByteBuffer
+import java.nio.file.{FileAlreadyExistsException => NioFileAlreadyExistsException, Files, Path => NioPath, Paths, StandardOpenOption}
+import java.nio.file.attribute.PosixFilePermissions
 import java.util
 import java.util.concurrent.TimeUnit
 
@@ -137,6 +140,71 @@ class FileSystemStateStore(
       fileContext.delete(absPath(key), false)
     } catch {
       case _: FileNotFoundException => warn(s"Failed to remove non-existed file: ${key}")
+    }
+  }
+
+  override def tryExclusiveCreate(key: String, value: Object): Boolean = {
+    if (fsUri.getScheme == "file" || fsUri.getScheme == null) {
+      tryExclusiveCreateNio(key, value)
+    } else {
+      tryExclusiveCreateHadoop(key, value)
+    }
+  }
+
+  /** True O_EXCL via kernel syscall -- for local/NFS/EFS mounts (file:// URIs).
+   *  NOTE: if write() fails after CREATE_NEW succeeds, the empty file remains
+   *  and that ID is permanently leaked. Acceptable trade-off -- tmp+rename
+   *  would break O_EXCL semantics. */
+  private def tryExclusiveCreateNio(key: String, value: Object): Boolean = {
+    val nioPath = Paths.get(fsUri.getPath, key)
+    Files.createDirectories(nioPath.getParent)
+    try {
+      val ownerOnly = PosixFilePermissions.asFileAttribute(
+        PosixFilePermissions.fromString("rw-------"))
+      val opts = util.EnumSet.of(
+        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+      val ch = Files.newByteChannel(nioPath, opts, ownerOnly)
+      try {
+        ch.write(ByteBuffer.wrap(serializeToBytes(value)))
+      } finally {
+        ch.close()
+      }
+      true
+    } catch {
+      case _: NioFileAlreadyExistsException => false
+      case _: UnsupportedOperationException =>
+        warn("POSIX file permissions not supported -- state file will use default umask.")
+        tryExclusiveCreateNioFallback(nioPath, value)
+    }
+  }
+
+  private def tryExclusiveCreateNioFallback(nioPath: NioPath, value: Object): Boolean = {
+    try {
+      val out = Files.newOutputStream(nioPath,
+        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+      try {
+        out.write(serializeToBytes(value))
+      } finally {
+        out.close()
+      }
+      true
+    } catch {
+      case _: NioFileAlreadyExistsException => false
+    }
+  }
+
+  /** Hadoop FileContext create without OVERWRITE -- safe on HDFS where NameNode
+   *  enforces exclusivity server-side. */
+  private def tryExclusiveCreateHadoop(key: String, value: Object): Boolean = {
+    val path = absPath(key)
+    try {
+      val flags = util.EnumSet.of(CreateFlag.CREATE)
+      usingResource(fileContext.create(path, flags, CreateOpts.createParent())) { out =>
+        out.write(serializeToBytes(value))
+      }
+      true
+    } catch {
+      case _: FileAlreadyExistsException => false
     }
   }
 
