@@ -71,6 +71,15 @@ abstract class StateStore(livyConf: LivyConf) extends JsonMapper {
    * @throws Exception Throw when persisting the state store fails.
    */
   def remove(key: String): Unit
+
+  /**
+   * Atomic exclusive create (O_CREAT|O_EXCL). Fails if key already exists.
+   * Implementations MUST provide a globally-atomic create-if-absent; a
+   * check-then-set fallback is not acceptable here because it reintroduces
+   * the very race this method exists to close.
+   * @return true if this call created the key, false if it already existed.
+   */
+  def tryExclusiveCreate(key: String, value: Object): Boolean
 }
 
 /**

@@ -33,4 +33,6 @@ class BlackholeStateStore(livyConf: LivyConf) extends StateStore(livyConf) {
   def getChildren(key: String): Seq[String] = List.empty[String]
 
   def remove(key: String): Unit = {}
+
+  override def tryExclusiveCreate(key: String, value: Object): Boolean = true
 }

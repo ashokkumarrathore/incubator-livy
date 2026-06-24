@@ -29,6 +29,7 @@ import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.{Random, Try}
+import scala.util.control.NonFatal
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import org.apache.hadoop.fs.Path
@@ -39,7 +40,7 @@ import org.apache.livy.client.common.HttpMessages._
 import org.apache.livy.rsc.{PingJob, RSCClient, RSCConf}
 import org.apache.livy.rsc.driver.Statement
 import org.apache.livy.server.AccessManager
-import org.apache.livy.server.recovery.SessionStore
+import org.apache.livy.server.recovery.{SessionStore, StateFileCollisionException}
 import org.apache.livy.sessions._
 import org.apache.livy.sessions.Session._
 import org.apache.livy.sessions.SessionState.Dead
@@ -96,67 +97,99 @@ object InteractiveSession extends Logging {
     val impersonatedUser = accessManager.checkImpersonation(proxyUser, owner)
     val namespace = SparkApp.getNamespace(request.conf, livyConf)
 
-    val client = mockClient.orElse {
-      val conf = SparkApp.prepareSparkConf(appTag, livyConf, prepareConf(
-        request.conf, request.jars, request.files, request.archives, request.pyFiles, livyConf))
-
-      val builderProperties = prepareBuilderProp(conf, request.kind, livyConf)
-
-      val userOpts: Map[String, Option[String]] = Map(
-        "spark.driver.cores" -> request.driverCores.map(_.toString),
-        SparkLauncher.DRIVER_MEMORY -> request.driverMemory.map(_.toString),
-        SparkLauncher.EXECUTOR_CORES -> request.executorCores.map(_.toString),
-        SparkLauncher.EXECUTOR_MEMORY -> request.executorMemory.map(_.toString),
-        "spark.executor.instances" -> request.numExecutors.map(_.toString),
-        "spark.app.name" -> request.name.map(_.toString),
-        "spark.yarn.queue" -> request.queue
-      )
-
-      userOpts.foreach { case (key, opt) =>
-        opt.foreach { value => builderProperties.put(key, value) }
-      }
-
-      builderProperties.getOrElseUpdate("spark.app.name", s"livy-session-$id")
-
-      info(s"Creating Interactive session $id: [owner: $owner, request: $request]")
-      val builder = new LivyClientBuilder()
-        .setAll(builderProperties.asJava)
-        .setConf("livy.client.session-id", id.toString)
-        .setConf(RSCConf.Entry.DRIVER_CLASS.key(), "org.apache.livy.repl.ReplDriver")
-        .setConf(RSCConf.Entry.PROXY_USER.key(), impersonatedUser.orNull)
-        .setURI(new URI("rsc:/"))
-
-      Option(builder.build().asInstanceOf[RSCClient])
+    // Claim the session id exclusively in the state store before constructing
+    // the session object so collisions surface synchronously to the retry
+    // wrapper in SessionServlet -- throwing inside start() (invoked later via
+    // SessionManager.register) fires outside the retry's scope.
+    val initialMetadata = InteractiveRecoveryMetadata(
+      id, request.name, None, appTag, request.kind,
+      request.heartbeatTimeoutInSecond, owner, ttl, idleTimeout,
+      request.driverMemory, request.driverCores, request.executorMemory, request.executorCores,
+      request.conf, request.archives, request.files, request.jars,
+      request.numExecutors, request.pyFiles, request.queue,
+      impersonatedUser, None, namespace)
+    if (!sessionStore.trySave(RECOVERY_SESSION_TYPE, initialMetadata)) {
+      throw new StateFileCollisionException(id, "interactive")
     }
 
-    new InteractiveSession(
-      id,
-      name,
-      None,
-      appTag,
-      client,
-      SessionState.Starting,
-      request.kind,
-      request.heartbeatTimeoutInSecond,
-      livyConf,
-      owner,
-      impersonatedUser,
-      ttl,
-      idleTimeout,
-      sessionStore,
-      request.driverMemory,
-      request.driverCores,
-      request.executorMemory,
-      request.executorCores,
-      request.conf,
-      request.archives,
-      request.files,
-      request.jars,
-      request.numExecutors,
-      request.pyFiles,
-      request.queue,
-      namespace,
-      mockApp)
+    var client: Option[RSCClient] = None
+    try {
+      client = mockClient.orElse {
+        val conf = SparkApp.prepareSparkConf(appTag, livyConf, prepareConf(
+          request.conf, request.jars, request.files, request.archives, request.pyFiles, livyConf))
+
+        val builderProperties = prepareBuilderProp(conf, request.kind, livyConf)
+
+        val userOpts: Map[String, Option[String]] = Map(
+          "spark.driver.cores" -> request.driverCores.map(_.toString),
+          SparkLauncher.DRIVER_MEMORY -> request.driverMemory.map(_.toString),
+          SparkLauncher.EXECUTOR_CORES -> request.executorCores.map(_.toString),
+          SparkLauncher.EXECUTOR_MEMORY -> request.executorMemory.map(_.toString),
+          "spark.executor.instances" -> request.numExecutors.map(_.toString),
+          "spark.app.name" -> request.name.map(_.toString),
+          "spark.yarn.queue" -> request.queue
+        )
+
+        userOpts.foreach { case (key, opt) =>
+          opt.foreach { value => builderProperties.put(key, value) }
+        }
+
+        builderProperties.getOrElseUpdate("spark.app.name", s"livy-session-$id")
+
+        info(s"Creating Interactive session $id: [owner: $owner, request: $request]")
+        val builder = new LivyClientBuilder()
+          .setAll(builderProperties.asJava)
+          .setConf("livy.client.session-id", id.toString)
+          .setConf(RSCConf.Entry.DRIVER_CLASS.key(), "org.apache.livy.repl.ReplDriver")
+          .setConf(RSCConf.Entry.PROXY_USER.key(), impersonatedUser.orNull)
+          .setURI(new URI("rsc:/"))
+
+        Option(builder.build().asInstanceOf[RSCClient])
+      }
+
+      new InteractiveSession(
+        id,
+        name,
+        None,
+        appTag,
+        client,
+        SessionState.Starting,
+        request.kind,
+        request.heartbeatTimeoutInSecond,
+        livyConf,
+        owner,
+        impersonatedUser,
+        ttl,
+        idleTimeout,
+        sessionStore,
+        request.driverMemory,
+        request.driverCores,
+        request.executorMemory,
+        request.executorCores,
+        request.conf,
+        request.archives,
+        request.files,
+        request.jars,
+        request.numExecutors,
+        request.pyFiles,
+        request.queue,
+        namespace,
+        mockApp)
+    } catch {
+      case NonFatal(e) =>
+        client.foreach(c => try c.stop(true) catch {
+          case NonFatal(stopEx) =>
+            warn(s"Failed to stop RSCClient during rollback for interactive session $id", stopEx)
+        })
+        try {
+          sessionStore.remove(RECOVERY_SESSION_TYPE, id)
+        } catch {
+          case NonFatal(rollbackEx) =>
+            warn(s"Failed to remove recovery file for interactive session $id " +
+              s"after create() failure", rollbackEx)
+        }
+        throw e
+    }
   }
 
   def recover(
@@ -462,7 +495,6 @@ class InteractiveSession(
   private var app: Option[SparkApp] = None
 
   override def start(): Unit = {
-    sessionStore.save(RECOVERY_SESSION_TYPE, recoveryMetadata)
     heartbeat()
     app = mockApp.orElse {
       val driverProcess = client.flatMap { c => Option(c.getDriverProcess) }

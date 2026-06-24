@@ -89,7 +89,7 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
   private[this] final val sessionStateRetainedInSec =
     TimeUnit.MILLISECONDS.toNanos(livyConf.getTimeAsMs(LivyConf.SESSION_STATE_RETAIN_TIME))
 
-  mockSessions.getOrElse(recover()).foreach(register)
+  mockSessions.getOrElse(recover()).foreach(register(_, fromRecovery = true))
   new GarbageCollector().start()
 
   def nextId(): Int = synchronized {
@@ -98,7 +98,17 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
     id
   }
 
-  def register(session: S): S = {
+  def register(session: S): S = register(session, fromRecovery = false)
+
+  /**
+   * fromRecovery=true means the session was loaded from an existing state-store
+   * entry (recover() at startup or refresh() re-scan). In that case the state
+   * file is authoritative -- it was written by an external writer or a prior
+   * run -- and we MUST NOT delete it on a local start() failure or name conflict.
+   * Only fresh-create flows (servlet POST) own their state file and should roll
+   * it back on failure.
+   */
+  private def register(session: S, fromRecovery: Boolean): S = {
     synchronized {
       sessions.get(session.id) match {
         case Some(existing) =>
@@ -111,17 +121,44 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
         if (sessionsByName.contains(sessionName)) {
           val errMsg = s"Duplicate session name: ${session.name} for session ${session.id}"
           error(errMsg)
-          session.stop()
+          if (!fromRecovery) {
+            // Fresh-create path owns the state file (Session.create calls
+            // trySave before returning); roll it back so we don't leak an
+            // orphan recovery file that nothing will ever clean up.
+            removeQuietly(session.id)
+            session.stop()
+          }
           throw new IllegalArgumentException(errMsg)
         } else {
           sessionsByName.put(sessionName, session)
         }
       }
       sessions.put(session.id, session)
-      session.start()
+      try {
+        session.start()
+      } catch {
+        case NonFatal(e) =>
+          sessions.remove(session.id)
+          session.name.foreach(sessionsByName.remove)
+          if (!fromRecovery) {
+            // Same rollback as above: start() owns spinning up the spark process
+            // / RSC client and can fail after the id is already claimed.
+            removeQuietly(session.id)
+          }
+          throw e
+      }
     }
     info(s"Registered new session ${session.id}")
     session
+  }
+
+  private def removeQuietly(id: Int): Unit = {
+    try {
+      sessionStore.remove(sessionType, id)
+    } catch {
+      case NonFatal(e) =>
+        warn(s"Failed to remove recovery file for session $id after registration failure", e)
+    }
   }
 
   def get(id: Int): Option[S] = sessions.get(id)
@@ -253,7 +290,7 @@ class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
       sessionMetadata.flatMap(_.toOption)
         .filterNot(m => sessions.contains(m.id))
         .map(sessionRecovery)
-        .foreach(register)
+        .foreach(register(_, fromRecovery = true))
 
       val added = sessions.size - before
       info(s"Refreshed $sessionType sessions: added=$added, total=${sessions.size}," +

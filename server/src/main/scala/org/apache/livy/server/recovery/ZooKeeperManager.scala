@@ -24,7 +24,7 @@ import org.apache.curator.framework.api.UnhandledErrorListener
 import org.apache.curator.framework.CuratorFramework
 import org.apache.curator.framework.CuratorFrameworkFactory
 import org.apache.curator.retry.RetryNTimes
-import org.apache.zookeeper.KeeperException.NoNodeException
+import org.apache.zookeeper.KeeperException.{NodeExistsException, NoNodeException}
 
 import org.apache.livy.LivyConf
 import org.apache.livy.Logging
@@ -89,6 +89,23 @@ class ZooKeeperManager(
       curatorClient.create().creatingParentsIfNeeded().forPath(key, data)
     } else {
       curatorClient.setData().forPath(key, data)
+    }
+  }
+
+  /**
+   * Atomic create-if-absent. ZooKeeper's create() is exclusive by default and
+   * throws NodeExistsException if the znode is already present, giving us a
+   * cluster-wide O_CREAT|O_EXCL primitive.
+   *
+   * @return true if this call created the znode, false if it already existed.
+   */
+  def createIfAbsent(key: String, value: Object): Boolean = {
+    val data = serializeToBytes(value)
+    try {
+      curatorClient.create().creatingParentsIfNeeded().forPath(key, data)
+      true
+    } catch {
+      case _: NodeExistsException => false
     }
   }
 
